@@ -1,0 +1,97 @@
+#!/bin/bash
+# volume-scroll: volume com sensibilidade a velocidade do scroll.
+# Uso adaptativo: volume-scroll + | volume-scroll -
+# Uso fixo (legado): volume-scroll +3 | volume-scroll -3
+#
+# Tick isolado (pausa maior que 300ms) = passo FINE.
+# Rajada continua = passo cresce FINE+1, FINE+2... ate MAXSTEP.
+# Alvo sempre em @DEFAULT_SINK@: o pactl resolve o sink padrao na hora,
+# entao trocar de fone/saida nao deixa o scroll preso no aparelho antigo.
+step_arg="${1:-+}"
+# Botoes de calibragem (exporte antes de chamar, ex: VOL_SCROLL_FINE=3 volume-scroll +).
+# Sem reload do Hyprland: o script le a cada tick.
+FINE=${VOL_SCROLL_FINE:-10}
+MAXSTEP=${VOL_SCROLL_MAX:-10}
+RESET_MS=${VOL_SCROLL_RESET_MS:-300}
+sink="@DEFAULT_SINK@"
+if [[ $step_arg == "--status" ]]; then
+  echo "volume-scroll v4 FINE=$FINE MAXSTEP=$MAXSTEP RESET_MS=${RESET_MS}ms"
+  pactl get-sink-volume "$sink" 2>/dev/null | awk 'NR==1{for(i=1;i<=NF;i++) if($i ~ /%$/) {print "volume atual: " $i; exit}}'
+  exit 0
+fi
+runtime="${XDG_RUNTIME_DIR:-/tmp}"
+osd_stamp="$runtime/volume-scroll.osd"
+vel_state="$runtime/volume-scroll.vel"
+
+if [[ $step_arg == "+" || $step_arg == "up" ]]; then
+  dir="+"
+  adaptive=1
+elif [[ $step_arg == "-" || $step_arg == "down" ]]; then
+  dir="-"
+  adaptive=1
+elif [[ $step_arg =~ ^([+-])([0-9]+)%?$ ]]; then
+  dir="${BASH_REMATCH[1]}"
+  mag="${BASH_REMATCH[2]}"
+  adaptive=0
+else
+  echo "Uso: $0 +|-|+N|-N" >&2
+  exit 1
+fi
+
+# Passo adaptativo por velocidade. A posicao vem do proprio sink a cada tick,
+# entao mudanca feita por fora (teclas de midia, outro app) nunca dessincroniza.
+if ((adaptive)); then
+  now=$(date +%s%3N)
+  last=0
+  burst=0
+  [[ -r $vel_state ]] && read -r last burst <"$vel_state" 2>/dev/null
+  [[ $last =~ ^[0-9]+$ ]] || last=0
+  [[ $burst =~ ^[0-9]+$ ]] || burst=0
+  dt=$((now - last))
+  if ((dt > RESET_MS)); then
+    burst=0
+    mag=$FINE
+  else
+    burst=$((burst + 1))
+    mag=$((FINE + burst))
+    ((mag > MAXSTEP)) && mag=$MAXSTEP
+  fi
+  tracked=$(pactl get-sink-volume "$sink" 2>/dev/null |
+    awk 'NR == 1 { for (i = 1; i <= NF; i++) if ($i ~ /%$/) { sub("%", "", $i); print $i; exit } }')
+  [[ $tracked =~ ^[0-9]+$ ]] || tracked=50
+  # Aplica teto e piso na conta, antes do set.
+  if [[ $dir == "+" ]]; then
+    next=$((tracked + mag))
+    ((next > 100)) && { mag=$((100 - tracked)); next=100; }
+  else
+    next=$((tracked - mag))
+    ((next < 0)) && { mag=$tracked; next=0; }
+  fi
+  printf '%s %s\n' "$now" "$burst" >"$vel_state"
+fi
+
+if ((mag > 0)); then
+  pactl set-sink-volume "$sink" "${dir}${mag}%" 2>/dev/null || exit 1
+  pactl set-sink-mute "$sink" 0 2>/dev/null
+fi
+
+# Debounce do OSD: so o ultimo tick da rajada mostra.
+date +%s%3N >"$osd_stamp"
+(
+  sleep 0.18
+  last_osd=$(cat "$osd_stamp" 2>/dev/null || echo 0)
+  now_osd=$(date +%s%3N)
+  ((now_osd - last_osd >= 150)) || exit 0
+  percent=$(pactl get-sink-volume "$sink" 2>/dev/null |
+    awk 'NR == 1 { for (i = 1; i <= NF; i++) if ($i ~ /%$/) { sub("%", "", $i); print $i; exit } }')
+  if (( ${percent:-0} > 100 )); then
+    pactl set-sink-volume "$sink" 100%
+    percent=100
+  fi
+  if [[ $(pactl get-sink-mute "$sink" 2>/dev/null) == *yes ]] || ((${percent:-0} == 0)); then
+    icon="volume-muted"
+  else
+    icon="volume-high"
+  fi
+  omarchy-osd -i "$icon" -p "${percent:-0}"
+) & disown
